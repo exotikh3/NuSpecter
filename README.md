@@ -1,0 +1,179 @@
+# NuSpecter
+
+Zero-copy numpy array sharing between Python processes via POSIX shared memory.
+
+Instead of pickling array data across process boundaries, NuSpecter stores arrays in shared memory and passes lightweight descriptors. The receiving process attaches to the same memory region and gets a numpy view with no deserialization overhead.
+
+## Why
+
+Standard `multiprocessing.Queue` serializes every array with pickle — for a 4 MB float32 array that means 4 MB copied into the queue pipe on every `put()`, and another 4 MB reconstructed on `get()`. At high throughput this becomes the bottleneck.
+
+NuSpecter replaces that with a one-time copy into shared memory and a ~200-byte handle passed over the queue. The consumer gets a direct numpy view of the same memory pages.
+
+## Benchmark
+
+```
+Benchmark: 10000 arrays of shape (300, 300, 3) (1.0 MB each, 10300 MB total)
+
+Running shared memory benchmark ...
+Running pickle benchmark ...
+
+Method                 Time (s)   Arrays/s    Bandwidth
+--------------------------------------------------------
+Shared memory              4.38     2283.0     2351.4 MB/s
+Pickle                     8.59     1164.0     1198.9 MB/s
+
+Speedup: 1.96x faster with shared memory
+```
+
+Run it yourself:
+
+```bash
+python main.py
+```
+
+## Installation
+
+Requires Python 3.8+ and numpy. No C extensions.
+
+From source:
+
+```bash
+git clone https://github.com/yourname/nu-specter
+cd nu-specter
+pip install .
+```
+
+## Quick start
+
+```python
+import numpy as np
+import multiprocessing as mp
+from nu_specter import SharedQueue
+
+def worker(q_in, results):
+    while True:
+        block = q_in.get()
+        if block is None:
+            break
+        results.put(block.array.mean())
+        block.close()   # required: releases mapping and ACKs the producer
+
+if __name__ == "__main__":
+    q = SharedQueue()
+    results = mp.Queue()
+
+    p = mp.Process(target=worker, args=(q, results))
+    p.start()
+
+    for _ in range(10):
+        q.put(np.random.rand(1024, 1024).astype(np.float32))
+
+    q.put(None)   # sentinel — non-array values pass through as-is
+    p.join()
+    q.close()
+```
+
+**One rule:** the consumer must call `block.close()` when done. This releases the memory mapping and sends an ACK back to the producer so it can free the shared memory block.
+
+## API
+
+### `SharedQueue`
+
+Drop-in replacement for `multiprocessing.Queue` that transparently routes numpy arrays through shared memory.
+
+```python
+q = SharedQueue(maxsize=0)
+
+q.put(arr)          # producer: copies arr into shm, enqueues only the handle
+block = q.get()     # consumer: returns a SharedBlock with a zero-copy numpy view
+block.array         # the numpy array — same data, no copy
+block.close()       # release mapping + ACK producer to free shm
+q.close()           # drain pending ACKs, unlink any in-flight blocks
+```
+
+Non-array values (e.g. `None` sentinels) pass through unchanged.
+
+### `BlockPool`
+
+For fixed-shape pipelines where per-message allocation overhead matters. Pre-allocates N shared memory slots and recycles them.
+
+```python
+pool = BlockPool(shape=(1024, 1024), dtype=np.float32, capacity=4)
+
+# Producer:
+slot = pool.acquire()        # blocks until a slot is free
+slot.array[:] = my_data      # write directly into shared memory — no copy
+queue.put(slot.handle)
+slot.close()                 # detach mapping (slot stays allocated)
+
+# Consumer:
+block = SharedBlock.from_handle(queue.get())
+process(block.array)
+block.close()
+ack_queue.put(block.handle.ref_id)   # signal producer the slot is free
+
+# Producer receives ACK:
+pool.release(ack_queue.get())
+
+# Shutdown:
+pool.shutdown()
+```
+
+Use `BlockPool` as a context manager for automatic cleanup:
+
+```python
+with BlockPool(shape=(512, 512), dtype=np.uint8, capacity=8) as pool:
+    ...
+```
+
+### `SharedBlock`
+
+Low-level building block. Owns or attaches to a single shared memory region.
+
+```python
+# Producer
+block = SharedBlock.from_array(arr)
+handle = block.handle          # send this to another process
+block.close()                  # detach; data stays in shm
+block.unlink()                 # destroy shm (after consumer is done)
+
+# Consumer
+block = SharedBlock.from_handle(handle)
+arr = block.array              # zero-copy numpy view
+block.close()                  # release mapping; never calls unlink
+```
+
+### `ArrayHandle`
+
+A frozen, fully picklable dataclass that describes an array in shared memory. This is the only object that crosses process boundaries — it contains the shm name, shape, dtype, and a UUID for ACK correlation. No array data.
+
+## Exceptions
+
+| Exception | When |
+|---|---|
+| `BlockClosedError` | Accessing `.array` after `close()` |
+| `PoolExhaustedError` | `BlockPool.acquire()` timed out with no free slots |
+| `HandleMismatchError` | Attaching to shm whose size doesn't match the handle |
+| `SharedMemoryError` | Base class for all library exceptions |
+
+## How it works
+
+1. `put(arr)` copies `arr` into a new POSIX shared memory block (one copy, always C-contiguous) and enqueues a small `ArrayHandle` descriptor (~200 bytes) over a standard `mp.Queue`.
+2. `get()` receives the handle, calls `SharedMemory(name=..., create=False)` to attach, and wraps the buffer in `np.frombuffer` — zero copy.
+3. When the consumer calls `block.close()`, an ACK is posted back to the producer via a second `mp.Queue`. A background daemon thread in the producer drains ACKs and calls `shm.unlink()`.
+4. If the consumer crashes, `SharedQueue.close()` force-unlinks all in-flight blocks. An `atexit` `ResourceTracker` is a final safety net.
+
+## Limitations
+
+- **Single producer per queue** — `SharedQueue` tracks in-flight blocks in the producer process only; multiple producers writing to the same queue is not supported.
+- **Single consumer per message** — each handle is sent once and unlinked on a single ACK. Fan-out (broadcast to multiple consumers) requires manual use of `SharedBlock` and `ArrayHandle`.
+- **`block.close()` is mandatory** — forgetting it leaks shared memory until `SharedQueue.close()` or process exit.
+- **POSIX shared memory** — works on Linux and macOS. Windows support depends on Python's `multiprocessing.shared_memory` implementation and may have different cleanup behavior.
+
+## Development
+
+```bash
+uv sync --extra dev
+uv run pytest
+```
