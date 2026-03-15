@@ -37,17 +37,6 @@ Run it yourself:
 python main.py
 ```
 
-## Installation
-
-Requires Python 3.8+ and numpy. No C extensions.
-
-From source:
-
-```bash
-git clone https://github.com/yourname/nu-specter
-cd nu-specter
-pip install .
-```
 
 ## Quick start
 
